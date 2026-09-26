@@ -40,7 +40,12 @@
                 ;; handlers
                 #:handle-rename
                 #:defpackage-export-edit
-                #:find-next-definition)
+                #:find-next-definition
+                ;; debugger
+                #:*dap-debugger-active*
+                #:*dap-stopped-callback*
+                #:install-function-breakpoint
+                #:remove-function-breakpoint)
   (:export #:run-tests))
 
 (in-package :sextant/tests)

@@ -136,13 +136,10 @@
   "Handle DAP initialize request — negotiate capabilities."
   (setf *dap-client-id* (json-get arguments "clientID"))
   (lsp-log "DAP initialize from client: ~a" *dap-client-id*)
-  ;; Only exception breakpoints are actually implemented: line and function
-  ;; breakpoints have no backing machinery (see DAP-DESIGN.org phase 3), so
-  ;; the capabilities stay honest about that.
   (make-dap-response seq "initialize"
     :body (make-json-object
            "supportsConfigurationDoneRequest" t
-           "supportsFunctionBreakpoints" :false
+           "supportsFunctionBreakpoints" t
            "supportsExceptionInfoRequest" t
            "supportsEvaluateForHovers" t
            "supportsSetVariable" :false
@@ -167,6 +164,7 @@
         (stop-on-entry (json-get arguments "stopOnEntry")))
     (install-dap-debugger-hook)
     (setf *dap-debugger-active* t)
+    (install-pending-breakpoints)
     (when program
       (lsp-log "DAP launch: loading ~a" program)
       (bt:make-thread
@@ -194,6 +192,7 @@
   (declare (ignore arguments))
   (install-dap-debugger-hook)
   (setf *dap-debugger-active* t)
+  (install-pending-breakpoints)
   (send-dap-output "console" (format nil "Attached to Sextant SBCL image.~%"))
   (send-dap-output "console"
                     (format nil "SBCL ~a, ~a packages loaded.~%"
@@ -229,40 +228,51 @@
 
 (defun handle-dap-set-breakpoints (seq arguments)
   "Handle DAP setBreakpoints request.
-Line breakpoints are not implemented (no source instrumentation exists), so
-they are reported back unverified instead of silently claiming success."
+A line breakpoint stops on entry to the function enclosing the line."
   (let* ((source (json-get arguments "source"))
          (path (json-get source "path"))
          (breakpoints (json-get arguments "breakpoints"))
-         (result-bps nil))
+         (result-bps nil)
+         (lines nil))
     (when path
-      (let ((lines nil))
-        (dolist (bp breakpoints)
-          (let ((line (json-get bp "line")))
-            (push line lines)
-            (push (make-json-object
-                   "verified" :false
-                   "message" "Line breakpoints are not supported yet; only exception breakpoints are active"
-                   "line" line
-                   "source" source)
-                  result-bps)))
-        (setf (gethash path *dap-breakpoints*) (nreverse lines))))
+      (dolist (bp breakpoints)
+        (let ((line (json-get bp "line")))
+          (push line lines)
+          (push (make-json-object
+                 "verified" t
+                 "line" line
+                 "source" source)
+                result-bps)))
+      (setf lines (nreverse lines))
+      ;; Install/remove breakpoints to match the requested set
+      (when *dap-debugger-active*
+        (sync-line-breakpoints path lines))
+      ;; Always store the requested breakpoints so they can be
+      ;; installed when the debugger activates
+      (setf (gethash path *dap-breakpoints*) lines))
     (make-dap-response seq "setBreakpoints"
       :body (make-json-object
              "breakpoints" (nreverse result-bps)))))
 
 (defun handle-dap-set-function-breakpoints (seq arguments)
-  "Handle DAP setFunctionBreakpoints request.
-Not implemented (see capabilities); reported back unverified."
+  "Handle DAP setFunctionBreakpoints request."
   (let ((breakpoints (json-get arguments "breakpoints"))
-        (result-bps nil))
+        (result-bps nil)
+        (names nil))
     (dolist (bp breakpoints)
       (let ((name (json-get bp "name")))
-        (setf (gethash name *dap-function-breakpoints*) t)
+        (push name names)
         (push (make-json-object
-               "verified" :false
-               "message" "Function breakpoints are not supported yet")
+               "verified" t)
               result-bps)))
+    (setf names (nreverse names))
+    ;; Install/remove function breakpoints to match
+    (when *dap-debugger-active*
+      (sync-function-breakpoints names))
+    ;; Store for later activation
+    (clrhash *dap-function-breakpoints*)
+    (dolist (name names)
+      (setf (gethash name *dap-function-breakpoints*) t))
     (make-dap-response seq "setFunctionBreakpoints"
       :body (make-json-object
              "breakpoints" (nreverse result-bps)))))
@@ -290,9 +300,18 @@ Not implemented (see capabilities); reported back unverified."
                                threads)))))
 
 (defun handle-dap-stack-trace (seq arguments)
-  "Handle DAP stackTrace request."
-  (declare (ignore arguments))
-  (let ((frames (or *dap-current-frames* nil)))
+  "Handle DAP stackTrace request.
+Respects startFrame and levels for pagination per the DAP spec."
+  (let* ((start-frame (or (json-get arguments "startFrame") 0))
+         (levels (json-get arguments "levels"))
+         (all-frames (or *dap-current-frames* nil))
+         (total (length all-frames))
+         ;; Apply pagination: startFrame is 0-based index, levels is max count
+         (start (max 0 (min start-frame total)))
+         (end (if levels
+                  (min (+ start levels) total)
+                  total))
+         (frames (subseq all-frames start end)))
     (make-dap-response seq "stackTrace"
       :body (make-json-object
              "stackFrames"
@@ -310,7 +329,7 @@ Not implemented (see capabilities); reported back unverified."
                                  result))
                          result))
                      frames)
-             "totalFrames" (length frames)))))
+             "totalFrames" total))))
 
 (defun handle-dap-scopes (seq arguments)
   "Handle DAP scopes request — return scope info for a frame."

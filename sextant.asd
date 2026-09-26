@@ -1,5 +1,5 @@
 (defsystem "sextant"
-  :version "0.1.0"
+  :version "0.2.0"
   :author "Glenn Thompson"
   :license "MIT"
   :description "A Common Lisp Language Server Protocol (LSP) implementation"
@@ -34,6 +34,7 @@
                  (:file "json-test")
                  (:file "document-test")
                  (:file "source-index-test")
+                 (:file "debugger-test")
                  (:file "introspection-test"))))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :sextant/tests '#:run-tests)

@@ -128,9 +128,9 @@ DAP has no native "restart" concept. Options:
 - [ ] =threads= — list SBCL threads
 
 ** Phase 3: Breakpoints
-- [ ] =setExceptionBreakpoints= — break on all/specific condition types
-- [ ] =setFunctionBreakpoints= — instrument named functions
-- [ ] =setBreakpoints= — line-level (harder, may need source mapping)
+- [X] =setExceptionBreakpoints= — break on all/specific condition types
+- [X] =setFunctionBreakpoints= — instrument named functions
+- [X] =setBreakpoints= — stops on entry to the enclosing function
 
 ** Phase 4: Execution Control
 - [ ] =continue= — invoke restart
