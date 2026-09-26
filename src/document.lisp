@@ -8,19 +8,64 @@
 (defvar *documents* (make-hash-table :test 'equal)
   "Map of URI -> document content (string).")
 
+(defvar *eof-form* (cons :sextant-eof-form nil)
+  "Unique sentinel for READ: using a keyword like :EOF would truncate
+processing when the file itself contains a top-level occurrence of that
+keyword, so a fresh cons is used instead.")
+
+(defvar *position-encoding* :utf-16
+  "Negotiated LSP position encoding. utf-16 is the protocol default; when the
+client offers utf-32 we pick it because our offsets count codepoints, which
+matches utf-32 code units exactly (utf-16 is handled by counting surrogate
+pairs as two units; see char-position-units).")
+
+(defun uri-percent-decode (string)
+  "Decode %XX escapes in STRING as UTF-8 (invalid sequences are kept as-is)."
+  (if (find #\% string)
+      (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                                 :fill-pointer 0 :adjustable t)))
+        (loop with len = (length string)
+              for i from 0 below len
+              do (let ((c (char string i)))
+                   (if (and (char= c #\%)
+                            (< (+ i 2) len)
+                            (digit-char-p (char string (1+ i)) 16)
+                            (digit-char-p (char string (+ i 2)) 16))
+                       (progn
+                         (vector-push-extend
+                          (parse-integer string :start (1+ i) :end (+ i 3) :radix 16)
+                          bytes)
+                         (incf i 2))
+                       (vector-push-extend (char-code c) bytes))))
+        (babel:octets-to-string bytes :encoding :utf-8))
+      string))
+
+(defun uri-percent-encode (string)
+  "Percent-encode STRING as UTF-8 for use in a file URI path: every byte
+outside the unreserved set (plus the path separator '/') becomes %XX."
+  (with-output-to-string (out)
+    (loop for byte across (babel:string-to-octets string :encoding :utf-8)
+          do (if (or (and (>= byte #x30) (<= byte #x39))    ; 0-9
+                     (and (>= byte #x41) (<= byte #x5A))    ; A-Z
+                     (and (>= byte #x61) (<= byte #x7A))    ; a-z
+                     (member byte '(#x2D #x5F #x2E #x7E #x2F))) ; - _ . ~ /
+                 (write-char (code-char byte) out)
+                 (format out "%~2,'0x" byte)))))
+
 (defun uri-to-path (uri)
-  "Convert a file:// URI to a filesystem path."
-  (if (and (>= (length uri) 7)
-           (string= "file://" (subseq uri 0 7)))
-      (subseq uri 7)
-      uri))
+  "Convert a file:// URI to a filesystem path, decoding percent escapes."
+  (let ((path (if (and (>= (length uri) 7)
+                       (string= "file://" (subseq uri 0 7)))
+                  (subseq uri 7)
+                  uri)))
+    (uri-percent-decode path)))
 
 (defun path-to-uri (path)
-  "Convert a filesystem path to a file:// URI."
+  "Convert a filesystem path to a file:// URI, percent-encoding as needed."
   (if (and (>= (length path) 7)
            (string= "file://" (subseq path 0 7)))
       path
-      (concatenate 'string "file://" path)))
+      (concatenate 'string "file://" (uri-percent-encode path))))
 
 (defun document-open (uri text)
   "Register an opened document."
@@ -65,8 +110,17 @@ Range has 'start' and 'end' positions, each with 'line' and 'character'."
   "Get the current text of a document."
   (gethash uri *documents*))
 
+(defun char-position-units (c)
+  "Width of character C in code units of the negotiated position encoding:
+a codepoint outside the BMP is one utf-32 unit but two utf-16 units."
+  (if (and (eq *position-encoding* :utf-16)
+           (>= (char-code c) #x10000))
+      2
+      1))
+
 (defun line-col-to-offset (text line col)
-  "Convert 0-based LINE and COL to a character offset in TEXT."
+  "Convert 0-based LINE and COL (counted in position-encoding code units)
+to a character offset in TEXT. The result is clamped to the end of LINE."
   (let ((pos 0)
         (current-line 0))
     (loop while (and (< pos (length text))
@@ -74,16 +128,24 @@ Range has 'start' and 'end' positions, each with 'line' and 'character'."
           do (when (char= (char text pos) #\Newline)
                (incf current-line))
              (incf pos))
-    (min (+ pos col) (length text))))
+    (let ((units 0))
+      (loop while (and (< pos (length text))
+                       (< units col)
+                       (not (char= (char text pos) #\Newline)))
+            do (incf units (char-position-units (char text pos)))
+               (incf pos)))
+    pos))
 
 (defun offset-to-line-col (text offset)
-  "Convert character OFFSET to (line . col) in TEXT."
+  "Convert character OFFSET to (line . col), where COL is counted in
+position-encoding code units."
   (let ((line 0)
         (col 0))
     (loop for i from 0 below (min offset (length text))
-          do (if (char= (char text i) #\Newline)
-                 (progn (incf line) (setf col 0))
-                 (incf col)))
+          do (let ((c (char text i)))
+               (if (char= c #\Newline)
+                   (progn (incf line) (setf col 0))
+                   (incf col (char-position-units c)))))
     (cons line col)))
 
 (defun symbol-at-position (text line col)
@@ -115,46 +177,6 @@ Returns the symbol string or NIL."
 ;;; ============================================================
 ;;; S-expression Range Utilities
 ;;; ============================================================
-
-(defun find-sexp-at (text offset)
-  "Find the innermost s-expression containing OFFSET in TEXT.
-Returns (start . end) character offsets, or NIL."
-  (let ((len (length text))
-        (best-start nil)
-        (best-end nil))
-    ;; Walk through finding all parens, track nesting
-    (let ((paren-stack nil)
-          (in-string nil)
-          (escape nil))
-      (loop for i from 0 below len
-            for c = (char text i)
-            do (cond
-                 (escape (setf escape nil))
-                 ((char= c #\\) (setf escape t))
-                 ((char= c #\")
-                  (if in-string
-                      (setf in-string nil)
-                      (setf in-string t)))
-                 (in-string nil)
-                 ((char= c #\;)
-                  ;; Skip comment to end of line
-                  (loop while (and (< i (1- len))
-                                   (not (char= (char text (1+ i)) #\Newline)))
-                        do (incf i)))
-                 ((char= c #\()
-                  (push i paren-stack))
-                 ((char= c #\))
-                  (when paren-stack
-                    (let ((start (pop paren-stack))
-                          (end (1+ i)))
-                      ;; If offset is within this sexp, track it
-                      (when (and (<= start offset) (<= offset end))
-                        (when (or (null best-start)
-                                  (> start best-start))
-                          (setf best-start start
-                                best-end end)))))))))
-    (when best-start
-      (cons best-start best-end))))
 
 (defun find-all-enclosing-sexps (text offset)
   "Find all s-expressions enclosing OFFSET, innermost first.
@@ -334,38 +356,101 @@ Returns a list of LSP Location objects."
      *documents*)
     (nreverse results)))
 
+;;; ============================================================
+;;; Definition form recognition
+;;; Shared by the source indexer (source-index.lisp), the document
+;;; definition/symbol searchers and the handlers.
+;;; ============================================================
+
+(defparameter *definition-operators*
+  '(("DEFUN"             . :function)
+    ("DEFMACRO"          . :macro)
+    ("DEFGENERIC"        . :generic)
+    ("DEFMETHOD"         . :method)
+    ("DEFVAR"            . :variable)
+    ("DEFPARAMETER"      . :parameter)
+    ("DEFCONSTANT"       . :constant)
+    ("DEFCLASS"          . :class)
+    ("DEFSTRUCT"         . :struct)
+    ("DEFINE-CONDITION"  . :condition)
+    ("DEFTYPE"           . :type)
+    ("DEFPACKAGE"        . :package))
+  "Alist of (operator-name . kind) for recognized definition forms.")
+
+(defun definition-operator-kind (operator)
+  "If OPERATOR (a string) is a recognized definition operator, return its
+kind keyword, else NIL. Matching any \"def*\" prefix is not enough: a call
+like (default-foo bar) must not be mistaken for a definition of BAR."
+  (cdr (assoc operator *definition-operators* :test #'string-equal)))
+
+(defun operator-after-paren (text paren-pos)
+  "Return the operator token following the '(' at PAREN-POS in TEXT, or NIL."
+  (let ((len (length text))
+        (start (1+ paren-pos)))
+    (loop while (and (< start len)
+                     (member (char text start)
+                             '(#\Space #\Tab #\Newline #\Return)))
+          do (incf start))
+    (let ((end start))
+      (loop while (and (< end len) (symbol-char-p (char text end)))
+            do (incf end))
+      (when (> end start)
+        (subseq text start end)))))
+
+(defun form-name-token (text start)
+  "Read the name token of a definition form, where START is the offset just
+after the operator. Handles plain symbol names and wrapped names such as
+(setf foo) and (defstruct (foo ...)). Returns (values name start end), where
+START/END delimit the name in TEXT, or NIL if there is no name."
+  (let ((len (length text))
+        (ws '(#\Space #\Tab #\Newline #\Return)))
+    (labels ((skip-ws (i)
+               (loop while (and (< i len) (member (char text i) ws))
+                     do (incf i))
+               i)
+             (read-token (i)
+               (let* ((s (skip-ws i))
+                      (e s))
+                 (loop while (and (< e len) (symbol-char-p (char text e)))
+                       do (incf e))
+                 (if (> e s) (values s e) (values nil nil)))))
+      (setf start (skip-ws start))
+      (when (< start len)
+        (if (char= (char text start) #\()
+            ;; Wrapped name: (foo ...) or (setf foo)
+            (multiple-value-bind (first-start first-end) (read-token (1+ start))
+              (when first-start
+                (if (string-equal "setf" (subseq text first-start first-end))
+                    ;; (setf foo): the name is the second token
+                    (multiple-value-bind (s e) (read-token first-end)
+                      (when s (values (subseq text s e) s e)))
+                    (values (subseq text first-start first-end)
+                            first-start first-end))))
+            ;; Plain symbol name
+            (multiple-value-bind (s e) (read-token start)
+              (when s (values (subseq text s e) s e))))))))
+
 (defun find-definition-in-documents (name)
-  "Search all open documents for a (def* NAME ...) form.
+  "Search all open documents for a definition form naming NAME.
 Returns (uri line col) or NIL."
   (let ((uname (string-upcase name))
         (result nil))
     (maphash
      (lambda (uri text)
        (unless result
-         (let ((len (length text)))
-           (loop for i from 0 below len
-                 do (when (and (char= (char text i) #\()
-                               (< (+ i 4) len)
-                               (string-equal "def" (subseq text (1+ i)
-                                                            (min (+ i 4) len))))
-                      (let* ((space-pos (position-if
-                                         (lambda (ch) (member ch '(#\Space #\Tab #\Newline)))
-                                         text :start (1+ i)))
-                             (name-start (when space-pos
-                                           (position-if-not
-                                            (lambda (ch) (member ch '(#\Space #\Tab #\Newline)))
-                                            text :start space-pos)))
-                             (name-end (when name-start
-                                         (position-if
-                                          (lambda (ch) (member ch '(#\Space #\Tab #\Newline #\( #\))))
-                                          text :start name-start))))
-                        (when (and name-start name-end
-                                   (string-equal uname (subseq text name-start name-end)))
-                          (let* ((def-line (count #\Newline text :end name-start))
-                                 (prev-nl (position #\Newline text :end name-start :from-end t))
-                                 (line-start (if prev-nl (1+ prev-nl) 0))
-                                 (def-col (- name-start line-start)))
-                            (setf result (list uri def-line def-col))))))))))
+         (loop for i from 0 below (length text)
+                 do (when (char= (char text i) #\()
+                        (let ((op (operator-after-paren text i)))
+                          (when (and op (definition-operator-kind op))
+                            (multiple-value-bind (def-name name-start)
+                                (form-name-token text (+ i 1 (length op)))
+                              (when (and def-name (string-equal uname def-name))
+                                (let* ((def-line (count #\Newline text :end name-start))
+                                       (prev-nl (position #\Newline text :end name-start :from-end t))
+                                       (line-start (if prev-nl (1+ prev-nl) 0))
+                                       (def-col (- name-start line-start)))
+                                  (setf result (list uri def-line def-col))
+                                  (return-from find-definition-in-documents result))))))))))
      *documents*)
     result))
 
@@ -388,3 +473,68 @@ Returns (start-line start-col end-line end-col) or NIL."
                 (end-lc (offset-to-line-col text end)))
             (list (car start-lc) (cdr start-lc)
                   (car end-lc) (cdr end-lc))))))))
+
+;;; ============================================================
+;;; Form-position utilities
+;;; Used both by the source indexer / introspection layer (locating
+;;; the Nth top-level form of a file) and by diagnostics (navigating
+;;; SBCL source paths).
+;;; ============================================================
+
+(defun skip-whitespace-and-comments (stream)
+  "Advance STREAM past whitespace and line comments.
+Returns the file-position of the first non-whitespace, non-comment character."
+  (loop
+    (let ((c (peek-char nil stream nil nil)))
+      (cond
+        ((null c) (return (file-position stream)))
+        ((member c '(#\Space #\Tab #\Newline #\Return #\Page))
+         (read-char stream))
+        ((char= c #\;)
+         ;; Skip to end of line
+         (loop for ch = (read-char stream nil nil)
+               while (and ch (not (char= ch #\Newline)))))
+        ;; Skip #| ... |# block comments
+        ((char= c #\#)
+         (let ((next (progn (read-char stream)
+                            (peek-char nil stream nil nil))))
+           (if (and next (char= next #\|))
+               (progn
+                 (read-char stream) ; consume |
+                 (let ((depth 1))
+                   (loop while (> depth 0)
+                         for ch = (read-char stream nil nil)
+                         while ch
+                         do (cond
+                              ((and (char= ch #\#)
+                                    (eql (peek-char nil stream nil nil) #\|))
+                               (read-char stream)
+                               (incf depth))
+                              ((and (char= ch #\|)
+                                    (eql (peek-char nil stream nil nil) #\#))
+                               (read-char stream)
+                               (decf depth))))))
+               ;; Not a block comment - back up and return
+               (progn
+                 (file-position stream (1- (file-position stream)))
+                 (return (file-position stream))))))
+        (t (return (file-position stream)))))))
+
+(defun find-nth-toplevel-form-position (text n)
+  "Find the character position of the Nth top-level form (0-indexed) in TEXT.
+Returns (line . col) or NIL."
+  (handler-case
+      (with-input-from-string (stream text)
+        (let ((form-count 0))
+          (loop
+            ;; Skip whitespace and comments to find actual form start
+            (let ((pos (skip-whitespace-and-comments stream)))
+              ;; Read the next form
+              (let ((form (read stream nil *eof-form*)))
+                (when (eq form *eof-form*)
+                  (return nil))
+                (when (= form-count n)
+                  ;; This is the form we want
+                  (return (offset-to-line-col text (min pos (length text)))))
+                (incf form-count))))))
+    (error () nil)))

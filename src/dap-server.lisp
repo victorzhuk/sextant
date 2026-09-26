@@ -6,6 +6,10 @@
 ;;; Reuses the same Content-Length JSON-RPC transport
 ;;; ============================================================
 
+;;; sb-bsd-sockets is an SBCL contrib, not always present in the core
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  #+sbcl (require :sb-bsd-sockets))
+
 (defvar *dap-port* 6009
   "TCP port for the DAP server.")
 
@@ -66,48 +70,59 @@ Called from the LSP server's start-server function."
   (let* ((stream (sb-bsd-sockets:socket-make-stream
                   socket :input t :output t
                   :element-type 'character
+                  :external-format :utf-8
                   :buffering :line)))
-    (setf *dap-output-stream* stream)
-    ;; Set up the stopped callback to send DAP events
-    (setf *dap-stopped-callback*
-          (lambda (condition thread)
-            (declare (ignore thread))
-            (lsp-log "DAP stopped: ~a" condition)
-            ;; Send stopped event
-            (send-dap-event "stopped"
-                            (make-json-object
-                             "reason" "exception"
-                             "description" (format nil "~a" condition)
-                             "threadId" 1
-                             "allThreadsStopped" t
-                             "text" (format nil "~a" (type-of condition))))
-            ;; Show restarts in debug console
-            (let ((restarts (get-condition-restarts)))
-              (send-dap-output "console"
-                               (format nil "~%Condition: ~a~%~%" condition))
-              (send-dap-output "console" "Available restarts:~%")
-              (dolist (r restarts)
-                (send-dap-output "console"
-                                 (format nil "  :restart ~d  [~a] ~a~%"
-                                         (getf r :index)
-                                         (getf r :name)
-                                         (getf r :description)))))))
-    (unwind-protect
-        (loop
-          (let ((msg (handler-case
-                         (read-lsp-message stream)
-                       (error (e)
-                         (lsp-log "DAP read error: ~a" e)
-                         nil))))
-            (unless msg
-              (lsp-log "DAP client disconnected")
-              (return))
-            (handle-dap-message msg)))
-      ;; Cleanup
-      (setf *dap-output-stream* nil)
-      (setf *dap-stopped-callback* nil)
-      (uninstall-dap-debugger-hook)
-      (handler-case
-          (sb-bsd-sockets:socket-close socket)
-        (error () nil))
-      (lsp-log "DAP connection closed"))))
+    ;; One DAP session at a time: the global output stream and stopped
+    ;; callback would be clobbered by concurrent clients
+    (if *dap-output-stream*
+        (progn
+          (lsp-log "DAP client refused: a session is already active")
+          (handler-case (sb-bsd-sockets:socket-close socket) (error () nil)))
+        (progn
+          (setf *dap-output-stream* stream)
+          ;; Set up the stopped callback to send DAP events
+          (setf *dap-stopped-callback*
+                (lambda (condition thread)
+                  (declare (ignore thread))
+                  (lsp-log "DAP stopped: ~a" condition)
+                  ;; Send stopped event
+                  (send-dap-event "stopped"
+                                  (make-json-object
+                                   "reason" "exception"
+                                   "description" (format nil "~a" condition)
+                                   "threadId" 1
+                                   "allThreadsStopped" t
+                                   "text" (format nil "~a" (type-of condition))))
+                  ;; Show restarts in debug console
+                  (let ((restarts (get-condition-restarts)))
+                    (send-dap-output "console"
+                                     (format nil "~%Condition: ~a~%~%" condition))
+                    (send-dap-output "console" "Available restarts:~%")
+                    (dolist (r restarts)
+                      (send-dap-output "console"
+                                       (format nil "  :restart ~d  [~a] ~a~%"
+                                               (getf r :index)
+                                               (getf r :name)
+                                               (getf r :description)))))))
+          (unwind-protect
+               (loop
+                 (let ((msg (handler-case
+                                (read-lsp-message stream)
+                              (error (e)
+                                (lsp-log "DAP read error: ~a" e)
+                                nil))))
+                   (cond
+                     ;; Malformed messages are skipped, not fatal
+                     ((eq msg :parse-error))
+                     ((null msg)
+                      (lsp-log "DAP client disconnected")
+                      (return))
+                     (t (handle-dap-message msg)))))
+            ;; Cleanup
+            (setf *dap-output-stream* nil)
+            (setf *dap-stopped-callback* nil)
+            (uninstall-dap-debugger-hook)
+            (handler-case
+                (sb-bsd-sockets:socket-close socket)
+              (error () nil))
+            (lsp-log "DAP connection closed"))))))

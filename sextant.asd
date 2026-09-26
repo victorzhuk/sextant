@@ -6,8 +6,7 @@
   :depends-on ("alexandria"
                "bordeaux-threads"
                "cl-ppcre"
-               "babel"
-               "swank")
+               "babel")
   :serial t
   :components ((:module "src"
                 :components
@@ -32,6 +31,9 @@
   :components ((:module "tests"
                 :components
                 ((:file "diagnostics-test")
+                 (:file "json-test")
+                 (:file "document-test")
+                 (:file "source-index-test")
                  (:file "introspection-test"))))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :sextant/tests '#:run-tests)

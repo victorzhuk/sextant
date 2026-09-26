@@ -151,14 +151,27 @@ sextant/
   src/
     package.lisp         ; Package definition
     json.lisp            ; Minimal JSON reader/writer (no deps)
-    transport.lisp       ; LSP JSON-RPC over stdio
-    document.lisp        ; Open file tracking, s-expression utilities
+    transport.lisp       ; LSP JSON-RPC over stdio (UTF-8 framed)
+    document.lisp        ; Open file tracking, position encoding,
+                         ;   s-expression and definition-form utilities
+    source-index.lisp    ; Source indexer: definitions/references via CL:READ
     lisp-introspection.lisp  ; Query running SBCL for docs/completions/defs/refs
-    diagnostics.lisp     ; Linting via compile-file + SBCL condition capture
-    handlers.lisp        ; LSP method dispatch (all 22 methods)
+    diagnostics.lisp     ; Linting via compile-file + SBCL condition capture,
+                         ;   debounced on a single worker thread
+    handlers.lisp        ; LSP method dispatch
+    debugger.lisp        ; SBCL debugger hook for DAP (debuggee threads only)
+    dap-handlers.lisp    ; DAP request/event handlers
+    dap-server.lisp      ; DAP TCP listener on localhost:6009
     server.lisp          ; Main message loop
     main.lisp            ; Entry point
+  tests/                 ; FiveAM test suite (asdf:test-system sextant)
 #+end_src
+
+On =initialize= the server negotiates the =utf-32= position encoding when the
+client offers it (its columns count codepoints) and indexes the workspace root
+directory in the background, so definitions, references and workspace symbols
+work before any file is opened. Definitions found in open-but-unsaved buffers
+are indexed incrementally on every change.
 
 ** How It Works
 

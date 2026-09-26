@@ -25,9 +25,28 @@
     (terpri *lsp-log*)
     (force-output *lsp-log*)))
 
+(defun make-stdio-stream (fd direction)
+  "Create an explicit UTF-8 stream over file descriptor FD (0=stdin, 1=stdout).
+The server must not depend on the locale's default external format: message
+framing counts UTF-8 bytes, and a non-UTF-8 stream would truncate or corrupt
+bodies containing multi-byte characters. Returns NIL when not on SBCL."
+  #+sbcl
+  (handler-case
+      (sb-sys:make-fd-stream fd
+                             :input (eq direction :input)
+                             :output (eq direction :output)
+                             :external-format :utf-8
+                             :buffering :none)
+    (error (e)
+      (lsp-log "Failed to create UTF-8 fd-stream for fd ~d: ~a" fd e)
+      nil))
+  #-sbcl nil)
+
 (defun read-lsp-message (&optional (stream *lsp-input*))
-  "Read one LSP message from STREAM. Returns parsed JSON alist or NIL on EOF.
-Content-Length is in bytes, so we read bytes and decode to UTF-8."
+  "Read one LSP message from STREAM. Returns the parsed JSON alist, or NIL on
+EOF, or :PARSE-ERROR when the body was received but could not be parsed.
+Content-Length is in bytes, so we read characters and count the bytes each
+decoded character occupies (stream must be UTF-8; see make-stdio-stream)."
   (let ((content-length nil))
     ;; Read headers (line-by-line is fine for ASCII headers)
     (loop for line = (read-line stream nil nil)
@@ -35,18 +54,18 @@ Content-Length is in bytes, so we read bytes and decode to UTF-8."
           do (let ((trimmed (string-trim '(#\Return #\Newline #\Space) line)))
                (when (zerop (length trimmed))
                  (return))
-               (when (cl-ppcre:scan "(?i)^content-length:\\s*(\\d+)" trimmed)
-                 (multiple-value-bind (match groups)
-                     (cl-ppcre:scan-to-strings "(?i)^content-length:\\s*(\\d+)" trimmed)
-                   (declare (ignore match))
-                   (when groups
-                     (setf content-length (parse-integer (aref groups 0))))))))
+               (multiple-value-bind (match groups)
+                   (cl-ppcre:scan-to-strings "(?i)^content-length:\\s*(\\d+)" trimmed)
+                 (declare (ignore match))
+                 (when groups
+                   (setf content-length (parse-integer (aref groups 0)))))))
     (unless content-length
       (return-from read-lsp-message nil))
     ;; Read body - Content-Length is in bytes but for JSON (mostly ASCII)
     ;; we read chars and handle any mismatch gracefully
     (let ((buf (make-array content-length :element-type 'character :fill-pointer 0))
-          (chars-read 0))
+          (chars-read 0)
+          (eof nil))
       (loop while (< chars-read content-length)
             for c = (read-char stream nil nil)
             while c
@@ -57,15 +76,17 @@ Content-Length is in bytes, so we read bytes and decode to UTF-8."
                        (cond ((<= code #x7F) 1)
                              ((<= code #x7FF) 2)
                              ((<= code #xFFFF) 3)
-                             (t 4)))))
-      (when (zerop (length buf))
+                             (t 4))))
+            finally (setf eof (< chars-read content-length)))
+      (when (or eof (zerop (length buf)))
+        ;; Truncated body: the peer went away mid-message; treat as EOF.
         (return-from read-lsp-message nil))
       (let ((body (coerce buf 'string)))
         (lsp-log "<<< ~a" body)
         (handler-case (json-parse body)
           (error (e)
             (lsp-log "JSON parse error: ~a" e)
-            nil))))))
+            :parse-error))))))
 
 (defun write-lsp-message (obj &optional (stream *lsp-output*))
   "Write OBJ as an LSP JSON-RPC message to STREAM."
@@ -77,17 +98,6 @@ Content-Length is in bytes, so we read bytes and decode to UTF-8."
               #\Return #\Linefeed #\Return #\Linefeed
               body)
       (force-output stream))))
-
-(defun write-lsp-body (body &optional (stream *lsp-output*))
-  "Write BODY (a JSON string) as an LSP message without further serialization.
-This is a small escape hatch used when the JSON writer cannot represent a value
-exactly as needed (e.g. distinguishing JSON null from an empty array)."
-  (lsp-log ">>> (raw) ~a" body)
-  (format stream "Content-Length: ~d~c~c~c~c~a"
-          (length (babel:string-to-octets body :encoding :utf-8))
-          #\Return #\Linefeed #\Return #\Linefeed
-          body)
-  (force-output stream))
 
 (defun make-response (id result)
   "Create a JSON-RPC response for request ID with RESULT."

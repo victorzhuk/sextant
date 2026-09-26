@@ -6,10 +6,20 @@
 ;;; sb-introspect calls are behind #+sbcl for portability.
 ;;; ============================================================
 
+;;; The #+sbcl reader conditionals below read sb-introspect: symbols, so the
+;;; contrib must be loaded before this file compiles (it used to be pulled in
+;;; as a side effect of the swank dependency; now it is explicit).
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  #+sbcl (require :sb-introspect))
+
 (defun find-symbol-in-packages (name)
   "Find a symbol by NAME string, searching common packages.
 Returns (values symbol package) or NIL."
   (let ((uname (string-upcase name)))
+    ;; Strip an uninterned-marker prefix so a token like "#:foo" resolves
+    ;; like the symbol name it carries
+    (when (and (> (length uname) 2) (string= "#:" uname :end2 2))
+      (setf uname (subseq uname 2)))
     ;; Check if it has a package qualifier
     (let ((colon (position #\: name)))
       (when colon
@@ -191,6 +201,43 @@ Merges results from the source index and the running image."
     ((boundp sym) 6)                                    ; Variable
     (t 6)))                                             ; Variable
 
+;;; --- Source location conversion ---
+
+(defun form-number-to-position (path form-num &optional cache)
+  "Convert a top-level form number (as reported by sb-introspect) in file
+PATH to a (line . col) position by skipping to the FORM-NUM-th top-level
+form. Form numbers are ordinals of top-level forms, not line numbers, so
+using them directly made definitions and references point at the wrong
+place. Returns NIL when the file is unreadable or FORM-NUM is out of range.
+CACHE, when given, is a per-call hash table avoiding repeated file reads
+when many results share one file."
+  (labels ((compute ()
+             (handler-case
+                 (let ((text (alexandria:read-file-into-string path)))
+                   (find-nth-toplevel-form-position text form-num))
+               (error () nil))))
+    (if (and cache path)
+        (let ((per-file (or (gethash path cache)
+                            (setf (gethash path cache)
+                                  (make-hash-table :test 'eql)))))
+          (multiple-value-bind (pos found) (gethash form-num per-file)
+            (if found pos
+                (setf (gethash form-num per-file) (compute)))))
+        (compute))))
+
+#+sbcl
+(defun definition-source-triple (source cache)
+  "Turn an sb-introspect definition-source into (path line col), converting
+the form number into a real line/column. Returns NIL without a pathname."
+  (let ((path (ignore-errors
+                (namestring (sb-introspect:definition-source-pathname source)))))
+    (when path
+      (let* ((form-num (sb-introspect:definition-source-form-number source))
+             (pos (form-number-to-position path form-num cache)))
+        (list path
+              (if pos (car pos) 0)
+              (if pos (cdr pos) 0))))))
+
 (defun symbol-definition-location (name)
   "Find the source location of symbol NAME.
 Returns (path line col) or NIL."
@@ -206,73 +253,12 @@ Returns (path line col) or NIL."
   #+sbcl
   (multiple-value-bind (sym) (find-symbol-in-packages name)
     (when (and sym (fboundp sym))
-      (let ((source (handler-case
-                        (sb-introspect:find-definition-sources-by-name
-                         sym :function)
-                      (error () nil))))
-        (when (and source (first source))
-          (let* ((src (first source))
-                 (namestring (sb-introspect:definition-source-pathname src))
-                 (form-path (sb-introspect:definition-source-form-number src)))
-            (when namestring
-              (let ((path (namestring namestring)))
-                (list path (or form-path 0) 0)))))))))
-
-;;; --- Diagnostics ---
-
-(defun compile-and-collect-diagnostics (text)
-  "Compile TEXT in a sandbox and return a list of diagnostics.
-Each diagnostic is (line character message severity)
-where severity: 1=error, 2=warning, 3=info, 4=hint."
-  (let ((diagnostics nil)
-        (pkg (find-package "COMMON-LISP-USER")))
-    (handler-case
-        (with-input-from-string (stream text)
-          (let ((*package* pkg)
-                (*read-eval* nil))
-            (loop for form = (handler-case (read stream nil :eof)
-                               (end-of-file () :eof)
-                               (reader-error (e)
-                                 (push (list 0 0
-                                             (format nil "Read error: ~a" e)
-                                             1)
-                                       diagnostics)
-                                 :eof)
-                               (error (e)
-                                 (push (list 0 0
-                                             (format nil "Read error: ~a" e)
-                                             1)
-                                       diagnostics)
-                                 :eof))
-                  until (eq form :eof)
-                  do (handler-case
-                         (let ((warnings nil))
-                           (handler-bind
-                               ((warning (lambda (w)
-                                           (push (format nil "~a" w) warnings)
-                                           (muffle-warning w))))
-                             (compile nil `(lambda () ,form)))
-                           (dolist (w (nreverse warnings))
-                             (let ((loc (find-form-line text form)))
-                               (push (list (car loc) (cdr loc) w 2)
-                                     diagnostics))))
-                       (error (e)
-                         (let ((loc (find-form-line text form)))
-                           (push (list (car loc) (cdr loc)
-                                       (format nil "~a" e)
-                                       1)
-                                 diagnostics)))))))
-      (error (e)
-        (push (list 0 0 (format nil "~a" e) 1) diagnostics)))
-    (nreverse diagnostics)))
-
-(defun find-form-line (text form)
-  "Try to find the line number of FORM in TEXT. Returns (line . col).
-Falls back to (0 . 0) if not found."
-  (declare (ignore form text))
-  ;; Without source tracking in READ, best we can do is (0 . 0)
-  ;; A more sophisticated approach would use source-tracking read
-  (cons 0 0))
+      (let ((sources (handler-case
+                         (sb-introspect:find-definition-sources-by-name
+                          sym :function)
+                       (error () nil))))
+        (when (and sources (first sources))
+          (definition-source-triple (first sources) nil))))))
 
 ;;; --- References ---
 
@@ -292,49 +278,30 @@ Returns a list of (path line col) entries."
     #+sbcl
     (multiple-value-bind (sym) (find-symbol-in-packages name)
       (when sym
-        ;; Who calls this function?
-        (when (fboundp sym)
-          (handler-case
-              (let ((callers (sb-introspect:who-calls sym)))
-                (dolist (caller callers)
-                  (let ((source (sb-introspect:definition-source-pathname caller)))
-                    (when source
-                      (let ((path (namestring source))
-                            (form-num (sb-introspect:definition-source-form-number caller)))
-                        (push (list path (or form-num 0) 0) results))))))
-            (error () nil)))
-        ;; Who binds this variable?
-        (when (boundp sym)
-          (handler-case
-              (let ((binders (sb-introspect:who-binds sym)))
-                (dolist (binder binders)
-                  (let ((source (sb-introspect:definition-source-pathname binder)))
-                    (when source
-                      (let ((path (namestring source))
-                            (form-num (sb-introspect:definition-source-form-number binder)))
-                        (push (list path (or form-num 0) 0) results))))))
-            (error () nil)))
-        ;; Who references this variable?
-        (handler-case
-            (let ((refs (sb-introspect:who-references sym)))
-              (dolist (ref refs)
-                (let ((source (sb-introspect:definition-source-pathname ref)))
-                  (when source
-                    (let ((path (namestring source))
-                          (form-num (sb-introspect:definition-source-form-number ref)))
-                      (push (list path (or form-num 0) 0) results))))))
-          (error () nil))
-        ;; Who macroexpands this?
-        (when (macro-function sym)
-          (handler-case
-              (let ((expanders (sb-introspect:who-macroexpands sym)))
-                (dolist (expander expanders)
-                  (let ((source (sb-introspect:definition-source-pathname expander)))
-                    (when source
-                      (let ((path (namestring source))
-                            (form-num (sb-introspect:definition-source-form-number expander)))
-                        (push (list path (or form-num 0) 0) results))))))
-            (error () nil)))))
+        (let ((cache (make-hash-table :test 'equal)))
+          (flet ((add-sources (sources)
+                   (dolist (src sources)
+                     (let ((triple (definition-source-triple src cache)))
+                       (when triple (push triple results))))))
+            ;; Who calls this function?
+            (when (fboundp sym)
+              (handler-case
+                  (add-sources (sb-introspect:who-calls sym))
+                (error () nil)))
+            ;; Who binds this variable?
+            (when (boundp sym)
+              (handler-case
+                  (add-sources (sb-introspect:who-binds sym))
+                (error () nil)))
+            ;; Who references this variable?
+            (handler-case
+                (add-sources (sb-introspect:who-references sym))
+              (error () nil))
+            ;; Who macroexpands this?
+            (when (macro-function sym)
+              (handler-case
+                  (add-sources (sb-introspect:who-macroexpands sym))
+                (error () nil)))))))
     ;; Deduplicate
     (remove-duplicates results :test #'equal)))
 
@@ -362,7 +329,8 @@ Returns list of (name kind container-name path line col)."
                     results)
               (incf count))))))
     ;; 2. Runtime image symbols (standard CL + loaded libraries)
-    (let ((uquery (string-upcase query)))
+    (let ((uquery (string-upcase query))
+          (loc-cache (make-hash-table :test 'equal)))
       (dolist (pkg (list-all-packages))
         (when (>= count limit) (return))
         (do-symbols (sym pkg)
@@ -379,11 +347,8 @@ Returns list of (name kind container-name path line col)."
                                (let ((sources (sb-introspect:find-definition-sources-by-name
                                                sym :function)))
                                  (when (and sources (first sources))
-                                   (let* ((src (first sources))
-                                          (path (sb-introspect:definition-source-pathname src))
-                                          (form-num (sb-introspect:definition-source-form-number src)))
-                                     (when path
-                                       (list (namestring path) (or form-num 0) 0))))))
+                                   (definition-source-triple (first sources)
+                                                             loc-cache))))
                            (error () nil))
                          #-sbcl nil))
                 (push (list (string-downcase name)
@@ -428,38 +393,27 @@ Returns list of (caller-name path line col)."
     (multiple-value-bind (sym) (find-symbol-in-packages name)
       (when (and sym (fboundp sym))
         (handler-case
-            (let ((callers (sb-introspect:who-calls sym)))
-              (dolist (caller callers)
-                (let ((source (sb-introspect:definition-source-pathname caller)))
-                  (when source
-                    (let* ((path (namestring source))
-                           (form-num (or (sb-introspect:definition-source-form-number caller) 0))
+            (let ((cache (make-hash-table :test 'equal)))
+              (dolist (caller (sb-introspect:who-calls sym))
+                (let ((triple (definition-source-triple caller cache)))
+                  (when triple
+                    (let* ((form-num (sb-introspect:definition-source-form-number caller))
                            (plist (sb-introspect:definition-source-plist caller))
                            (caller-name (or (getf plist :name)
-                                            (format nil "form-~d" form-num))))
+                                            (format nil "form-~d" (or form-num 0)))))
                       (push (list (format nil "~(~a~)" caller-name)
-                                  path form-num 0)
+                                  (first triple) (second triple) (third triple))
                             results))))))
           (error () nil))))
     (remove-duplicates results :test #'equal)))
 
 (defun symbol-outgoing-calls (name)
   "Find functions that the symbol NAME calls.
-This is harder - we compile and inspect the function's references.
-Returns list of (callee-name path line col)."
-  (multiple-value-bind (sym) (find-symbol-in-packages name)
-    (when (and sym (fboundp sym))
-      (let ((results nil))
-        ;; Use who-calls in reverse - look at the function's constants
-        ;; This is an approximation
-        (handler-case
-            (let ((callees (sb-introspect:who-calls sym)))
-              (declare (ignore callees))
-              ;; For outgoing, we'd need to analyze the function body
-              ;; SBCL doesn't directly support this, so return empty for now
-              nil)
-          (error () nil))
-        results))))
+Returns a list of (callee-name path line col).
+Not implemented: SBCL exposes who-calls (incoming) but no who-is-called-by;
+report an empty result rather than a wrong one."
+  (declare (ignore name))
+  nil)
 
 ;;; --- Semantic Token Classification ---
 
@@ -480,7 +434,8 @@ class, keyword, comment, or nil."
       ((and (boundp sym)
             (constantp sym)) :constant)
       ((boundp sym)
-       (if (eql (char (symbol-name sym) 0) #\*)
+       (if (and (> (length (symbol-name sym)) 0)
+                (eql (char (symbol-name sym) 0) #\*))
            :special-variable
            :variable))
       (t :variable))))

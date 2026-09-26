@@ -13,6 +13,12 @@
   "Return the sentinel value that serializes to an empty JSON array."
   +json-empty-array+)
 
+(defun json-array (list)
+  "Return LIST if non-empty, otherwise the empty-array sentinel.
+Use this wherever a JSON value must always be an array (never null),
+since NIL serializes as null."
+  (if list list +json-empty-array+))
+
 ;;; --- JSON Writing ---
 
 (defun json-write (obj stream)
@@ -135,14 +141,45 @@ numbers become numbers, true->T, false->:FALSE, null->NIL."
                (t (if (or (digit-char-p c) (char= c #\-))
                       (read-number)
                       (error "JSON parse error: unexpected ~c at ~d" c pos))))))
+         (read-hex-4 ()
+           (when (> (+ pos 4) len)
+             (error "JSON parse error: truncated \\u escape"))
+           (let ((code (parse-integer string :start pos :end (+ pos 4) :radix 16)))
+             (incf pos 4)
+             code))
+         (read-unicode-escape ()
+           ;; Handles surrogate pairs: a high surrogate (#xD800-#xDBFF) must be
+           ;; immediately followed by \uDC00-\uDFFF; the pair combines into one
+           ;; character outside the BMP.
+           (let ((code (read-hex-4)))
+             (cond
+               ((<= #xD800 code #xDBFF)
+                (unless (and (<= (+ pos 6) len)
+                             (char= (char string pos) #\\)
+                             (char= (char string (1+ pos)) #\u))
+                  (error "JSON parse error: unpaired high surrogate"))
+                (incf pos 2) ; skip \u
+                (let ((low (read-hex-4)))
+                  (unless (<= #xDC00 low #xDFFF)
+                    (error "JSON parse error: invalid low surrogate ~4,'0x" low))
+                  (code-char (+ #x10000
+                                (ash (- code #xD800) 10)
+                                (- low #xDC00)))))
+               ((<= #xDC00 code #xDFFF)
+                (error "JSON parse error: unpaired low surrogate"))
+               (t (code-char code)))))
          (read-json-string ()
            (advance) ; skip opening "
            (with-output-to-string (s)
              (loop
+               (unless (< pos len)
+                 (error "JSON parse error: unterminated string"))
                (let ((c (advance)))
                  (cond
                    ((char= c #\") (return))
                    ((char= c #\\)
+                    (unless (< pos len)
+                      (error "JSON parse error: dangling escape in string"))
                     (let ((esc (advance)))
                       (case esc
                         (#\" (write-char #\" s))
@@ -153,9 +190,8 @@ numbers become numbers, true->T, false->:FALSE, null->NIL."
                         (#\t (write-char #\Tab s))
                         (#\b (write-char #\Backspace s))
                         (#\f (write-char #\Page s))
-                        (#\u (let ((code (parse-integer string :start pos :end (+ pos 4) :radix 16)))
-                               (incf pos 4)
-                               (write-char (code-char code) s))))))
+                        (#\u (write-char (read-unicode-escape) s))
+                        (t (error "JSON parse error: bad escape ~c" esc)))))
                    (t (write-char c s)))))))
          (read-object ()
            (advance) ; skip {
@@ -197,8 +233,19 @@ numbers become numbers, true->T, false->:FALSE, null->NIL."
              (if (and (< pos len) (char= (peek) #\.))
                  (progn
                    (advance)
-                   (loop while (and (< pos len) (digit-char-p (peek))) do (advance))
-                   (read-from-string (subseq string start pos)))
+                   (loop while (and (< pos len) (digit-char-p (peek))) do (advance))))
+             ;; Optional exponent (e.g. 1e5, 2.5E-3)
+             (when (and (< pos len)
+                        (member (peek) '(#\e #\E)))
+               (advance)
+               (when (and (< pos len) (member (peek) '(#\+ #\-)))
+                 (advance))
+               (unless (and (< pos len) (digit-char-p (peek)))
+                 (error "JSON parse error: malformed exponent at ~d" pos))
+               (loop while (and (< pos len) (digit-char-p (peek))) do (advance)))
+             (if (find-if (lambda (c) (or (char= c #\.) (char= c #\e) (char= c #\E)))
+                          string :start start :end pos)
+                 (read-from-string (subseq string start pos))
                  (parse-integer string :start start :end pos))))
          (read-literal (expected value)
            (let ((elen (length expected)))

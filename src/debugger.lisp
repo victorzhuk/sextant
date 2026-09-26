@@ -38,30 +38,70 @@
 (defvar *dap-var-ref-map* (make-hash-table)
   "Map of variable reference ID -> (frame-index scope-type).")
 
+(defvar *dap-debuggee-threads* (make-hash-table :test 'eq)
+  "Threads currently running debuggee code. The debugger hook blocks only
+these threads on continue: without this scoping, an error in any other thread
+of the image (the LSP main loop, the diagnostics worker) would stall the whole
+server until a DAP client sends a continue.")
+
+(defun debuggee-thread-p (thread)
+  (bt:with-lock-held (*dap-continue-lock*)
+    (gethash thread *dap-debuggee-threads*)))
+
+(defun register-debuggee-thread (&optional (thread (bt:current-thread)))
+  (bt:with-lock-held (*dap-continue-lock*)
+    (setf (gethash thread *dap-debuggee-threads*) t)))
+
+(defun unregister-debuggee-thread (&optional (thread (bt:current-thread)))
+  (bt:with-lock-held (*dap-continue-lock*)
+    (remhash thread *dap-debuggee-threads*)))
+
+(defun clear-debuggee-threads ()
+  (bt:with-lock-held (*dap-continue-lock*)
+    (clrhash *dap-debuggee-threads*)))
+
+(defvar *dap-previous-debugger-hook* nil
+  "The *invoke-debugger-hook* value present before ours was installed, so it
+can be restored on disconnect instead of being clobbered.")
+
 (defun install-dap-debugger-hook ()
-  "Install our custom debugger hook to intercept conditions."
+  "Install our custom debugger hook to intercept conditions in debuggee threads."
+  (unless *dap-previous-debugger-hook*
+    (setf *dap-previous-debugger-hook* sb-ext:*invoke-debugger-hook*))
   (setf sb-ext:*invoke-debugger-hook*
         (lambda (condition hook)
-          (declare (ignore hook))
-          (when (and *dap-debugger-active*
-                     *dap-stopped-callback*
-                     (or *dap-break-on-exceptions*
-                         (typep condition 'error)))
-            (setf *dap-current-condition* condition)
-            (setf *dap-current-frames* (capture-stack-frames))
-            (clrhash *dap-frame-vars-cache*)
-            (setf *dap-next-var-ref* 1)
-            (clrhash *dap-var-ref-map*)
-            (funcall *dap-stopped-callback* condition
-                     sb-thread:*current-thread*)
-            ;; Block this thread until the debugger tells us to continue
-            (dap-wait-for-continue))))
+          (if (and *dap-debugger-active*
+                   *dap-stopped-callback*
+                   (debuggee-thread-p (bt:current-thread))
+                   (or *dap-break-on-exceptions*
+                       (typep condition 'error)))
+              (progn
+                ;; Reset before stopping (under the lock the waiter uses) so a
+                ;; continue racing with the stop cannot be lost
+                (bt:with-lock-held (*dap-continue-lock*)
+                  (setf *dap-should-continue* nil))
+                (setf *dap-current-condition* condition)
+                (setf *dap-current-frames* (capture-stack-frames))
+                (clrhash *dap-frame-vars-cache*)
+                (setf *dap-next-var-ref* 1)
+                (clrhash *dap-var-ref-map*)
+                (funcall *dap-stopped-callback* condition
+                         sb-thread:*current-thread*)
+                ;; Block this thread until the debugger tells us to continue
+                (dap-wait-for-continue))
+              ;; Not a debuggee stop: defer to whatever hook was installed
+              ;; before ours (or the default debugger)
+              (when *dap-previous-debugger-hook*
+                (funcall *dap-previous-debugger-hook* condition hook)))))
   (lsp-log "DAP debugger hook installed"))
 
 (defun uninstall-dap-debugger-hook ()
-  "Remove our custom debugger hook."
-  (setf sb-ext:*invoke-debugger-hook* nil)
+  "Remove our custom debugger hook, restoring the previous one."
+  (when *dap-previous-debugger-hook*
+    (setf sb-ext:*invoke-debugger-hook* *dap-previous-debugger-hook*)
+    (setf *dap-previous-debugger-hook* nil))
   (setf *dap-debugger-active* nil)
+  (clear-debuggee-threads)
   (lsp-log "DAP debugger hook removed"))
 
 (defvar *dap-continue-lock* (bt:make-lock "dap-continue-lock"))
@@ -69,8 +109,9 @@
 (defvar *dap-should-continue* nil)
 
 (defun dap-wait-for-continue ()
-  "Block the current thread until the DAP client sends a continue command."
-  (setf *dap-should-continue* nil)
+  "Block the current thread until the DAP client sends a continue command.
+*dap-should-continue* is reset by the debugger hook when the stop happens,
+not here, so a continue arriving between the stop and the wait is not lost."
   (bt:with-lock-held (*dap-continue-lock*)
     (loop until *dap-should-continue*
           do (bt:condition-wait *dap-continue-cv* *dap-continue-lock*))))

@@ -43,21 +43,8 @@
   "Lock protecting all index tables.")
 
 ;;; --- Definition form recognition ---
-
-(defparameter *definition-operators*
-  '(("DEFUN"             . :function)
-    ("DEFMACRO"          . :macro)
-    ("DEFGENERIC"        . :generic)
-    ("DEFMETHOD"         . :method)
-    ("DEFVAR"            . :variable)
-    ("DEFPARAMETER"      . :parameter)
-    ("DEFCONSTANT"       . :constant)
-    ("DEFCLASS"          . :class)
-    ("DEFSTRUCT"         . :struct)
-    ("DEFINE-CONDITION"  . :condition)
-    ("DEFTYPE"           . :type)
-    ("DEFPACKAGE"        . :package))
-  "Alist of (operator-name . kind) for recognized definition forms.")
+;;; *definition-operators* is defined in document.lisp (loaded earlier) and
+;;; shared with the document-level definition searchers.
 
 (defun definition-form-p (form)
   "If FORM is a definition form, return (kind name arglist) or NIL.
@@ -114,11 +101,12 @@ NAME is returned as an uppercase string."
 Reads all top-level forms with CL:READ and records definitions.
 Returns the number of definitions found."
   (let ((definitions nil)
-        (file-path (namestring (truename path))))
+        (file-path nil))
     (handler-case
         (with-open-file (stream path :direction :input
                                      :if-does-not-exist nil)
           (when stream
+            (setf file-path (namestring (truename path)))
             (let ((*package* (or (find-package "COMMON-LISP-USER")
                                  *package*))
                   (*read-eval* nil)
@@ -130,16 +118,16 @@ Returns the number of definitions found."
                 (loop
                   (let ((pos (file-position stream)))
                     (handler-case
-                        (let ((form (read stream nil :eof)))
-                          (when (eq form :eof) (return))
+                        (let ((form (read stream nil *eof-form*)))
+                          (when (eq form *eof-form*) (return))
                           (push (cons pos form) form-positions))
                       (error () (return)))))
                 ;; Process collected forms
                 (dolist (pos-form (nreverse form-positions))
-                  (let* ((byte-pos (car pos-form))
+                  (let* ((pos (car pos-form))
                          (form (cdr pos-form))
                          (line-col (offset-to-line-col text
-                                     (min byte-pos (length text))))
+                                     (min pos (length text))))
                          (def-info (definition-form-p form)))
                     (when def-info
                       (destructuring-bind (kind name arglist) def-info
@@ -153,41 +141,40 @@ Returns the number of definitions found."
                                :arglist arglist
                                :uri (path-to-uri file-path))
                               definitions)))))
-                ;; Also collect references from this file
+                ;; Store definitions first so references to this file's own
+                ;; definitions are indexed in the same pass
+                (bt:with-lock-held (*index-lock*)
+                  (remove-file-from-index file-path)
+                  (dolist (def definitions)
+                    (push def (gethash (index-entry-name def) *definition-index*)))
+                  (setf (gethash file-path *indexed-files*) (get-universal-time)))
+                ;; Then collect references from this file
                 (index-references-in-text text file-path)))))
       (error (e)
         (lsp-log "Index error for ~a: ~a" path e)))
-    ;; Store definitions in the global index
-    (bt:with-lock-held (*index-lock*)
-      ;; Remove old entries for this file
-      (remove-file-from-index file-path)
-      ;; Add new entries
-      (dolist (def definitions)
-        (push def (gethash (index-entry-name def) *definition-index*)))
-      ;; Mark as indexed
-      (setf (gethash file-path *indexed-files*) (get-universal-time)))
     (length definitions)))
 
 (defun index-references-in-text (text file-path)
   "Scan TEXT for symbol references and add them to *reference-index*.
 Finds occurrences of known definition names in non-comment, non-string positions."
-  (let ((refs nil))
-    ;; Collect all defined names we know about
-    (let ((known-names nil))
-      (bt:with-lock-held (*index-lock*)
-        (maphash (lambda (name entries)
-                   (declare (ignore entries))
-                   (push name known-names))
-                 *definition-index*))
-      ;; For each known name, find occurrences in this file
-      (dolist (name known-names)
-        (let ((positions (find-symbol-positions-in-code text name)))
-          (dolist (pos positions)
+  (let ((refs nil)
+        ;; Snapshot the set of known definition names once, outside the hot scan
+        (known (bt:with-lock-held (*index-lock*)
+                 (let ((names (make-hash-table :test 'equal)))
+                   (maphash (lambda (name entries)
+                              (declare (ignore entries))
+                              (setf (gethash name names) t))
+                            *definition-index*)
+                   names))))
+    (dolist (occ (scan-symbol-occurrences text))
+      (let ((name (string-upcase (subseq text (car occ) (cdr occ)))))
+        (when (gethash name known)
+          (let ((lc (offset-to-line-col text (car occ))))
             (push (make-ref-entry
                    :name name
                    :file file-path
-                   :line (car pos)
-                   :col (cdr pos)
+                   :line (car lc)
+                   :col (cdr lc)
                    :uri (path-to-uri file-path))
                   refs)))))
     ;; Store references
@@ -202,53 +189,84 @@ Finds occurrences of known definition names in non-comment, non-string positions
       (dolist (ref refs)
         (push ref (gethash (ref-entry-name ref) *reference-index*))))))
 
-(defun find-symbol-positions-in-code (text name)
-  "Find all positions of symbol NAME in TEXT, excluding comments and strings.
-Returns list of (line . col) pairs."
-  (let ((results nil)
-        (target (string-downcase name))
-        (downcased (string-downcase text))
-        (len (length text))
-        (tlen (length name)))
-    (let ((pos 0))
-      (loop
-        (let ((found (search target downcased :start2 pos)))
-          (unless found (return))
-          ;; Check word boundaries
-          (when (and (or (zerop found)
-                        (not (symbol-char-p (char text (1- found)))))
-                    (or (= (+ found tlen) len)
-                        (not (symbol-char-p (char text (+ found tlen))))))
-            ;; Check not in comment or string
-            (unless (in-comment-or-string-p text found)
-              (push (offset-to-line-col text found) results)))
-          (setf pos (1+ found)))))
-    (nreverse results)))
-
-(defun in-comment-or-string-p (text offset)
-  "Return T if OFFSET in TEXT is inside a comment or string literal."
-  (let ((in-string nil)
+(defun scan-symbol-occurrences (text)
+  "Single pass over TEXT collecting (start . end) offset pairs for every
+symbol-name occurrence in code (outside strings, comments, character
+literals and pipe-escaped symbols). Package qualifiers are skipped: for
+\"pkg:sym\" and \"#:sym\" the recorded occurrence points at just \"sym\".
+Runs in O(length of text), independent of how many known names exist."
+  (let ((len (length text))
+        (occurrences nil)
+        (i 0)
+        (in-string nil)
         (escape nil))
-    (loop for i from 0 below offset
-          for c = (char text i)
-          do (cond
-               (escape (setf escape nil))
-               ((char= c #\\) (setf escape t))
-               ((char= c #\")
-                (setf in-string (not in-string)))
-               ((and (not in-string) (char= c #\;))
-                ;; Rest of line is comment
-                (let ((eol (position #\Newline text :start i)))
-                  (if (or (null eol) (>= offset eol))
-                      ;; offset is in or past this comment line
-                      (if (null eol)
-                          (return t)   ; in comment to end of file
-                          (if (< offset eol)
-                              (return t)
-                              (setf i eol)))
-                      ;; offset is before end of line, skip to eol
-                      (setf i eol))))))
-    in-string))
+    (labels ((record-token (start end)
+               ;; Trim package prefixes off the token, keeping the offsets
+               ;; pointed at the bare symbol name
+               (let ((j start))
+                 (loop while (and (< j end) (char= (char text j) #\#))
+                       do (incf j))
+                 (let ((colon (position #\: text :start j :end end :from-end t)))
+                   (when colon (setf j (1+ colon))))
+                 (when (< j end)
+                   (push (cons j end) occurrences))))
+             (skip-block-comment ()
+               ;; i is just past the opening #|
+               (let ((depth 1))
+                 (loop while (and (< i len) (> depth 0))
+                       do (cond
+                            ((and (< (1+ i) len)
+                                  (char= (char text i) #\|)
+                                  (char= (char text (1+ i)) #\#))
+                             (decf depth) (incf i 2))
+                            ((and (< (1+ i) len)
+                                  (char= (char text i) #\#)
+                                  (char= (char text (1+ i)) #\|))
+                             (incf depth) (incf i 2))
+                            (t (incf i))))))
+             (skip-quoted-symbol ()
+               ;; i is at the opening | of a |...| symbol
+               (incf i)
+               (loop while (and (< i len) (not (char= (char text i) #\|)))
+                     do (if (and (char= (char text i) #\\) (< (1+ i) len))
+                            (incf i 2)
+                            (incf i)))
+               (incf i)))
+      (loop while (< i len)
+            do (let ((c (char text i)))
+                 (cond
+                   ;; Inside a string, only the closing quote matters
+                   (in-string
+                    (cond
+                      (escape (setf escape nil) (incf i))
+                      ((char= c #\\) (setf escape t) (incf i))
+                      ((char= c #\") (setf in-string nil) (incf i))
+                      (t (incf i))))
+                   ((char= c #\")
+                    (setf in-string t) (incf i))
+                   ;; Line comment: skip to end of line
+                   ((char= c #\;)
+                    (setf i (or (position #\Newline text :start i) len)))
+                   ;; #| ... |# block comment (nestable)
+                   ((and (char= c #\#) (< (1+ i) len) (char= (char text (1+ i)) #\|))
+                    (incf i 2)
+                    (skip-block-comment))
+                   ;; #\x character literal: skip #\ and the whole name, so
+                   ;; e.g. #\Newline does not register a "Newline" reference
+                   ((and (char= c #\#) (< (1+ i) len) (char= (char text (1+ i)) #\\))
+                    (incf i 2)
+                    (loop while (and (< i len) (symbol-char-p (char text i)))
+                          do (incf i)))
+                   ;; |...| multiple-escaped symbol
+                   ((char= c #\|) (skip-quoted-symbol))
+                   ;; Symbol token
+                   ((symbol-char-p c)
+                    (let ((start i))
+                      (loop while (and (< i len) (symbol-char-p (char text i)))
+                            do (incf i))
+                      (record-token start i)))
+                   (t (incf i))))))
+    (nreverse occurrences)))
 
 ;;; --- Buffer indexing (for unsaved content) ---
 
@@ -266,23 +284,24 @@ Used for didOpen/didChange to keep the index current before saving."
             (loop
               (let ((pos (file-position stream)))
                 (handler-case
-                    (let ((form (read stream nil :eof)))
-                      (when (eq form :eof) (return))
-                      (let ((def-info (definition-form-p form)))
-                        (when def-info
-                          (destructuring-bind (kind name arglist) def-info
-                            (let ((line-col (offset-to-line-col text
-                                              (min pos (length text)))))
-                              (push (make-index-entry
-                                     :name name
-                                     :package (package-name *package*)
-                                     :kind kind
-                                     :file file-path
-                                     :line (car line-col)
-                                     :col (cdr line-col)
-                                     :arglist arglist
-                                     :uri uri)
-                                    definitions))))))
+                    (let ((form (read stream nil *eof-form*)))
+                      (unless (eq form *eof-form*)
+                        (let ((def-info (definition-form-p form)))
+                          (when def-info
+                            (destructuring-bind (kind name arglist) def-info
+                              (let ((line-col (offset-to-line-col text
+                                                (min pos (length text)))))
+                                (push (make-index-entry
+                                       :name name
+                                       :package (package-name *package*)
+                                       :kind kind
+                                       :file file-path
+                                       :line (car line-col)
+                                       :col (cdr line-col)
+                                       :arglist arglist
+                                       :uri uri)
+                                      definitions))))))
+                      (when (eq form *eof-form*) (return)))
                   (error () (return)))))))
       (error (e)
         (lsp-log "Buffer index error for ~a: ~a" uri e)))
@@ -291,6 +310,9 @@ Used for didOpen/didChange to keep the index current before saving."
       (remove-file-from-index file-path)
       (dolist (def definitions)
         (push def (gethash (index-entry-name def) *definition-index*))))
+    ;; Index references too, so an open-but-unsaved buffer participates in
+    ;; find-references just like a saved file
+    (index-references-in-text text file-path)
     (length definitions)))
 
 ;;; --- ASDF system indexing ---
@@ -330,15 +352,16 @@ Returns the total number of definitions found."
     (lsp-log "Index complete: ~d definitions across ~d files" total (length files))
     total))
 
-(defun index-directory (dir &optional (extension "lisp"))
-  "Index all .lisp files under directory DIR recursively."
-  (let ((total 0)
-        (pattern (make-pathname :directory (append (pathname-directory dir)
-                                                   '(:wild-inferiors))
-                                :name :wild
-                                :type extension)))
-    (dolist (file (directory pattern))
-      (incf total (index-file file)))
+(defun index-directory (dir &optional (extensions '("lisp" "cl" "asd")))
+  "Index all Lisp source files under directory DIR recursively."
+  (let ((total 0))
+    (dolist (extension extensions)
+      (let ((pattern (make-pathname :directory (append (pathname-directory dir)
+                                                       '(:wild-inferiors))
+                                    :name :wild
+                                    :type extension)))
+        (dolist (file (directory pattern))
+          (incf total (index-file file)))))
     total))
 
 ;;; --- Index queries ---

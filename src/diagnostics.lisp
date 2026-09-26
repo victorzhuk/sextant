@@ -13,13 +13,19 @@
 (defconstant +severity-hint+        4)
 
 (defvar *diagnostics-debounce-time* 0.5
-  "Seconds to wait after last change before running diagnostics.")
-
-(defvar *diagnostics-timer* nil
-  "Timer for debounced diagnostics.")
+  "Seconds to wait after the most recent change before running diagnostics.")
 
 (defvar *diagnostics-lock* (bt:make-lock "diagnostics-lock")
-  "Lock for diagnostics state.")
+  "Lock for diagnostics scheduling state.")
+
+(defvar *diagnostics-cond* (bt:make-condition-variable :name "diagnostics-cv")
+  "Condition variable the diagnostics worker waits on.")
+
+(defvar *diagnostics-pending* (make-hash-table :test 'equal)
+  "Map of URI -> internal-real-time deadline for the debounced run.")
+
+(defvar *diagnostics-worker* nil
+  "The single worker thread that runs diagnostics, or NIL if none running.")
 
 ;;; --- Condition capture during compilation ---
 
@@ -96,64 +102,6 @@ each index after the top-level form index navigates into a nested sub-form."
              (sub-indices (rest indices)))
         (when (and form-idx (integerp form-idx))
           (navigate-source-path text form-idx sub-indices))))))
-
-(defun skip-whitespace-and-comments (stream)
-  "Advance STREAM past whitespace and line comments.
-Returns the file-position of the first non-whitespace, non-comment character."
-  (loop
-    (let ((c (peek-char nil stream nil nil)))
-      (cond
-        ((null c) (return (file-position stream)))
-        ((member c '(#\Space #\Tab #\Newline #\Return #\Page))
-         (read-char stream))
-        ((char= c #\;)
-         ;; Skip to end of line
-         (loop for ch = (read-char stream nil nil)
-               while (and ch (not (char= ch #\Newline)))))
-        ;; Skip #| ... |# block comments
-        ((char= c #\#)
-         (let ((next (progn (read-char stream)
-                            (peek-char nil stream nil nil))))
-           (if (and next (char= next #\|))
-               (progn
-                 (read-char stream) ; consume |
-                 (let ((depth 1))
-                   (loop while (> depth 0)
-                         for ch = (read-char stream nil nil)
-                         while ch
-                         do (cond
-                              ((and (char= ch #\#)
-                                    (eql (peek-char nil stream nil nil) #\|))
-                               (read-char stream)
-                               (incf depth))
-                              ((and (char= ch #\|)
-                                    (eql (peek-char nil stream nil nil) #\#))
-                               (read-char stream)
-                               (decf depth))))))
-               ;; Not a block comment - back up and return
-               (progn
-                 (file-position stream (1- (file-position stream)))
-                 (return (file-position stream))))))
-        (t (return (file-position stream)))))))
-
-(defun find-nth-toplevel-form-position (text n)
-  "Find the character position of the Nth top-level form (0-indexed) in TEXT.
-Returns (line . col) or NIL."
-  (handler-case
-      (with-input-from-string (stream text)
-        (let ((form-count 0))
-          (loop
-            ;; Skip whitespace and comments to find actual form start
-            (let ((pos (skip-whitespace-and-comments stream)))
-              ;; Read the next form
-              (let ((form (read stream nil :eof)))
-                (when (eq form :eof)
-                  (return nil))
-                (when (= form-count n)
-                  ;; This is the form we want
-                  (return (offset-to-line-col text (min pos (length text)))))
-                (incf form-count))))))
-    (error () nil)))
 
 (defun read-into-nth-subform (stream idx)
   "With STREAM at or before the opening paren of a list form, position STREAM
@@ -373,13 +321,19 @@ Returns (line . col) or NIL."
               (return (offset-to-line-col text found))))
           (setf pos (1+ found)))))))
 
-(defvar *diagnostics-temp-file*
-  (merge-pathnames "sextant-diag.lisp" (uiop:temporary-directory))
-  "Temp file path for compile-file based diagnostics.")
+(defvar *diagnostics-temp-counter* 0
+  "Counter for generating unique diagnostics temp file names.")
 
-(defvar *diagnostics-fasl-file*
-  (merge-pathnames "sextant-diag.fasl" (uiop:temporary-directory))
-  "Temp fasl output path.")
+(defun make-diagnostics-temp-pathname (type)
+  "Generate a unique temp pathname of the given TYPE (e.g. \"lisp\", \"fasl\").
+Each run gets its own files: concurrent compiles sharing a fixed temp source
+would clobber each other's contents mid-compilation."
+  (make-pathname
+   :defaults (uiop:temporary-directory)
+   :name (format nil "sextant-diag-~d-~d"
+                 (get-universal-time)
+                 (incf *diagnostics-temp-counter*))
+   :type type))
 
 (defun noise-warning-p (message)
   "Return T if MESSAGE is ASDF/SBCL startup noise we should ignore."
@@ -423,8 +377,8 @@ Returns a list of captured-condition structs."
     (when reader-errors
       (return-from compile-buffer-for-diagnostics reader-errors)))
   (let ((conditions nil)
-        (tmp-src *diagnostics-temp-file*)
-        (tmp-fasl *diagnostics-fasl-file*))
+        (tmp-src (make-diagnostics-temp-pathname "lisp"))
+        (tmp-fasl (make-diagnostics-temp-pathname "fasl")))
     (unwind-protect
          (progn
            ;; Write buffer text to temp file
@@ -609,22 +563,56 @@ Returns a list of LSP Diagnostic JSON objects."
 ;;; --- Debounced diagnostics (avoid running on every keystroke) ---
 
 (defun schedule-diagnostics (uri)
-  "Schedule diagnostics for URI with debouncing.
-Cancels any pending run and waits before executing."
+  "Schedule diagnostics for URI, debounced per file: the run happens
+*diagnostics-debounce-time* seconds after the most recent schedule for that
+URI. All runs execute on a single worker thread, so compiles are serialized
+and are never interrupted mid-flight (destroying a compiling thread would
+leak locks and corrupt compiler state)."
   (bt:with-lock-held (*diagnostics-lock*)
-    ;; Cancel existing timer
-    (when *diagnostics-timer*
-      (ignore-errors (bt:destroy-thread *diagnostics-timer*))
-      (setf *diagnostics-timer* nil))
-    ;; Schedule new run
-    (setf *diagnostics-timer*
-          (bt:make-thread
-           (lambda ()
-             (sleep *diagnostics-debounce-time*)
-             (handler-case
-                 (run-diagnostics uri)
-               (error (e)
-                 (lsp-log "Diagnostics thread error: ~a" e)))
-             (bt:with-lock-held (*diagnostics-lock*)
-               (setf *diagnostics-timer* nil)))
-           :name "sextant-diagnostics"))))
+    (setf (gethash uri *diagnostics-pending*)
+          (+ (get-internal-real-time)
+             (round (* *diagnostics-debounce-time*
+                       internal-time-units-per-second))))
+    (unless (and *diagnostics-worker* (bt:thread-alive-p *diagnostics-worker*))
+      (setf *diagnostics-worker*
+            (bt:make-thread #'diagnostics-worker-loop
+                            :name "sextant-diagnostics")))))
+
+(defun diagnostics-worker-loop ()
+  "Wait for pending diagnostic deadlines and run the due ones, one at a time.
+Exits when nothing is pending; the next schedule-diagnostics starts a new one."
+  (loop
+    (let ((due-uris nil))
+      (bt:with-lock-held (*diagnostics-lock*)
+        (loop
+          (let ((now (get-internal-real-time))
+                (earliest nil))
+            (maphash (lambda (uri deadline)
+                       (declare (ignore uri))
+                       (when (or (null earliest) (< deadline earliest))
+                         (setf earliest deadline)))
+                     *diagnostics-pending*)
+            (cond
+              ;; Nothing pending: exit; next schedule starts a fresh worker.
+              ((null earliest)
+               (setf *diagnostics-worker* nil)
+               (return-from diagnostics-worker-loop))
+              ;; Something is due: collect it and go run it.
+              ((<= earliest now)
+               (maphash (lambda (uri deadline)
+                          (when (<= deadline now)
+                            (remhash uri *diagnostics-pending*)
+                            (push uri due-uris)))
+                        *diagnostics-pending*)
+               (return))
+              ;; Not yet due: sleep until the earliest deadline (a new
+              ;; schedule pokes the condition variable with an earlier one).
+              (t
+               (bt:condition-wait *diagnostics-cond* *diagnostics-lock*
+                                  :timeout (/ (- earliest now)
+                                              internal-time-units-per-second)))))))
+      ;; Compile outside the lock, serialized by this single worker
+      (dolist (uri due-uris)
+        (handler-case (run-diagnostics uri)
+          (error (e)
+            (lsp-log "Diagnostics thread error: ~a" e)))))))

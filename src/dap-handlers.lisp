@@ -72,7 +72,12 @@
        (lsp-log "DAP request: ~a (seq=~a)" command seq)
        (let ((response (handle-dap-request command seq arguments)))
          (when response
-           (write-lsp-message response *dap-output-stream*))))
+           (write-lsp-message response *dap-output-stream*))
+         ;; The initialized event must follow the initialize response (DAP
+         ;; lifecycle); sending it here guarantees that ordering
+         (when (and response (string= command "initialize"))
+           (send-dap-event "initialized"))))
+      ((string= msg-type "event"))
       (t
        (lsp-log "DAP unknown message type: ~a" msg-type)))))
 
@@ -88,6 +93,8 @@
          (handle-dap-attach seq arguments))
         ((string= command "disconnect")
          (handle-dap-disconnect seq arguments))
+        ((string= command "terminate")
+         (handle-dap-terminate seq arguments))
         ((string= command "setBreakpoints")
          (handle-dap-set-breakpoints seq arguments))
         ((string= command "setFunctionBreakpoints")
@@ -129,34 +136,30 @@
   "Handle DAP initialize request — negotiate capabilities."
   (setf *dap-client-id* (json-get arguments "clientID"))
   (lsp-log "DAP initialize from client: ~a" *dap-client-id*)
-  (let ((response (make-dap-response seq "initialize"
-                    :body (make-json-object
-                           "supportsConfigurationDoneRequest" t
-                           "supportsFunctionBreakpoints" t
-                           "supportsExceptionInfoRequest" t
-                           "supportsEvaluateForHovers" t
-                           "supportsSetVariable" :false
-                           "supportsRestartRequest" :false
-                           "supportsTerminateRequest" t
-                           "supportsCompletionsRequest" :false
-                           "exceptionBreakpointFilters"
-                           (list (make-json-object
-                                  "filter" "all"
-                                  "label" "All Conditions"
-                                  "description" "Break on all CL conditions"
-                                  "default" :false)
-                                 (make-json-object
-                                  "filter" "errors"
-                                  "label" "Errors Only"
-                                  "description" "Break only on errors"
-                                  "default" t))))))
-    ;; Send initialized event after response
-    (bt:make-thread
-     (lambda ()
-       (sleep 0.1)
-       (send-dap-event "initialized"))
-     :name "dap-initialized-sender")
-    response))
+  ;; Only exception breakpoints are actually implemented: line and function
+  ;; breakpoints have no backing machinery (see DAP-DESIGN.org phase 3), so
+  ;; the capabilities stay honest about that.
+  (make-dap-response seq "initialize"
+    :body (make-json-object
+           "supportsConfigurationDoneRequest" t
+           "supportsFunctionBreakpoints" :false
+           "supportsExceptionInfoRequest" t
+           "supportsEvaluateForHovers" t
+           "supportsSetVariable" :false
+           "supportsRestartRequest" :false
+           "supportsTerminateRequest" t
+           "supportsCompletionsRequest" :false
+           "exceptionBreakpointFilters"
+           (list (make-json-object
+                  "filter" "all"
+                  "label" "All Conditions"
+                  "description" "Break on all CL conditions"
+                  "default" :false)
+                 (make-json-object
+                  "filter" "errors"
+                  "label" "Errors Only"
+                  "description" "Break only on errors"
+                  "default" t)))))
 
 (defun handle-dap-launch (seq arguments)
   "Handle DAP launch request — load and optionally run a file."
@@ -168,18 +171,21 @@
       (lsp-log "DAP launch: loading ~a" program)
       (bt:make-thread
        (lambda ()
-         (handler-case
-             (progn
-               (send-dap-output "console"
-                                (format nil "Loading ~a into Sextant image...~%" program))
-               (load program)
-               (send-dap-output "console"
-                                (format nil "Loaded ~a successfully.~%" program))
-               (unless stop-on-entry
-                 (send-dap-event "terminated")))
-           (error (e)
-             (send-dap-output "stderr" (format nil "Error loading ~a: ~a~%" program e))
-             (send-dap-event "terminated"))))
+         (register-debuggee-thread)
+         (unwind-protect
+              (handler-case
+                  (progn
+                    (send-dap-output "console"
+                                     (format nil "Loading ~a into Sextant image...~%" program))
+                    (load program)
+                    (send-dap-output "console"
+                                     (format nil "Loaded ~a successfully.~%" program))
+                    (unless stop-on-entry
+                      (send-dap-event "terminated")))
+                (error (e)
+                  (send-dap-output "stderr" (format nil "Error loading ~a: ~a~%" program e))
+                  (send-dap-event "terminated")))
+           (unregister-debuggee-thread)))
        :name "dap-launch-thread"))
     (make-dap-response seq "launch")))
 
@@ -204,6 +210,15 @@
   (dap-signal-continue)
   (make-dap-response seq "disconnect"))
 
+(defun handle-dap-terminate (seq arguments)
+  "Handle DAP terminate request — end the debug session like disconnect."
+  (declare (ignore arguments))
+  (uninstall-dap-debugger-hook)
+  (setf *dap-initialized* nil)
+  (dap-signal-continue)
+  (send-dap-event "terminated")
+  (make-dap-response seq "terminate"))
+
 (defun handle-dap-configuration-done (seq)
   "Handle DAP configurationDone request."
   (setf *dap-initialized* t)
@@ -213,7 +228,9 @@
 ;;; --- Breakpoint Handlers ---
 
 (defun handle-dap-set-breakpoints (seq arguments)
-  "Handle DAP setBreakpoints request."
+  "Handle DAP setBreakpoints request.
+Line breakpoints are not implemented (no source instrumentation exists), so
+they are reported back unverified instead of silently claiming success."
   (let* ((source (json-get arguments "source"))
          (path (json-get source "path"))
          (breakpoints (json-get arguments "breakpoints"))
@@ -224,7 +241,8 @@
           (let ((line (json-get bp "line")))
             (push line lines)
             (push (make-json-object
-                   "verified" t
+                   "verified" :false
+                   "message" "Line breakpoints are not supported yet; only exception breakpoints are active"
                    "line" line
                    "source" source)
                   result-bps)))
@@ -234,15 +252,16 @@
              "breakpoints" (nreverse result-bps)))))
 
 (defun handle-dap-set-function-breakpoints (seq arguments)
-  "Handle DAP setFunctionBreakpoints request."
-  (clrhash *dap-function-breakpoints*)
+  "Handle DAP setFunctionBreakpoints request.
+Not implemented (see capabilities); reported back unverified."
   (let ((breakpoints (json-get arguments "breakpoints"))
         (result-bps nil))
     (dolist (bp breakpoints)
       (let ((name (json-get bp "name")))
         (setf (gethash name *dap-function-breakpoints*) t)
         (push (make-json-object
-               "verified" t)
+               "verified" :false
+               "message" "Function breakpoints are not supported yet")
               result-bps)))
     (make-dap-response seq "setFunctionBreakpoints"
       :body (make-json-object
@@ -365,8 +384,7 @@
     ;; Handle restart commands
     (cond
       ((and expression
-            (or (cl-ppcre:scan "^:r(?:estart)?\\s+(\\d+)" expression)
-                (cl-ppcre:scan "^:restart\\s+(\\d+)" expression)))
+            (cl-ppcre:scan "^:r(?:estart)?\\s+(\\d+)" expression))
        (multiple-value-bind (match groups)
            (cl-ppcre:scan-to-strings ":r(?:estart)?\\s+(\\d+)" expression)
          (declare (ignore match))
@@ -377,7 +395,9 @@
              ;; Invoke restart in a separate thread to not block DAP
              (bt:make-thread
               (lambda ()
-                (invoke-restart-by-index index))
+                (register-debuggee-thread)
+                (unwind-protect (invoke-restart-by-index index)
+                  (unregister-debuggee-thread)))
               :name "dap-restart-invoker"))))
        (make-dap-response seq "evaluate"
          :body (make-json-object
@@ -401,19 +421,22 @@
       ;; propagate to the debugger hook instead of being caught here
       (t
        (if (string= context "repl")
-           ;; REPL: eval in background thread, errors trigger debugger
+           ;; REPL: eval in a debuggee thread, errors trigger the debugger
            (progn
              (bt:make-thread
               (lambda ()
-                (handler-case
-                    (let* ((form (read-from-string expression))
-                           (result (format nil "~s" (eval form))))
-                      (send-dap-output "console"
-                                       (format nil "~a~%" result)))
-                  ;; Only catch read errors — eval errors go to debugger hook
-                  (reader-error (e)
-                    (send-dap-output "stderr"
-                                     (format nil "Read error: ~a~%" e)))))
+                (register-debuggee-thread)
+                (unwind-protect
+                     (handler-case
+                         (let* ((form (read-from-string expression))
+                                (result (format nil "~s" (eval form))))
+                           (send-dap-output "console"
+                                            (format nil "~a~%" result)))
+                       ;; Only catch read errors — eval errors go to debugger hook
+                       (reader-error (e)
+                         (send-dap-output "stderr"
+                                          (format nil "Read error: ~a~%" e))))
+                  (unregister-debuggee-thread)))
               :name "dap-repl-eval")
              (make-dap-response seq "evaluate"
                :body (make-json-object

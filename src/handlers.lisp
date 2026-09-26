@@ -135,12 +135,43 @@
 
 (defun handle-initialize (params)
   "Handle initialize request."
-  (declare (ignore params))
-  (make-json-object
-   "capabilities" *server-capabilities*
-   "serverInfo" (make-json-object
-                 "name" "Sextant"
-                 "version" "0.1.0")))
+  (let* ((caps (json-get params "capabilities"))
+         (general (json-get caps "general"))
+         (encodings (json-get general "positionEncodings")))
+    (setf *position-encoding*
+          (if (and encodings (member "utf-32" encodings :test #'string=))
+              :utf-32
+              :utf-16))
+    (index-workspace-root params)
+    (append
+     (list (cons "positionEncoding"
+                 (if (eq *position-encoding* :utf-32) "utf-32" "utf-16")))
+     *server-capabilities*
+     (list (cons "serverInfo"
+                 (make-json-object
+                  "name" "Sextant"
+                  "version" "0.1.0"))))))
+
+(defun index-workspace-root (params)
+  "Best-effort background indexing of the workspace root directory, so
+definitions/references/workspace symbols work before any file is opened."
+  (let ((root (or (json-get params "rootUri")
+                  (json-get params "rootPath")
+                  (let ((folders (json-get params "workspaceFolders")))
+                    (and folders (json-get (first folders) "uri"))))))
+    (when root
+      (let ((path (uri-to-path root)))
+        (when (and path (uiop:directory-exists-p path))
+          (bt:make-thread
+           (lambda ()
+             (handler-case
+                 (progn
+                   (lsp-log "Indexing workspace at ~a" path)
+                   (let ((n (index-directory path)))
+                     (lsp-log "Workspace index complete: ~d definitions" n)))
+               (error (e)
+                 (lsp-log "Workspace indexing error: ~a" e))))
+           :name "sextant-workspace-index"))))))
 
 ;;; --- Shutdown ---
 
@@ -181,7 +212,7 @@
          (line (json-get pos "line"))
          (col (json-get pos "character"))
          (text (document-text uri))
-         (empty (make-json-object "isIncomplete" t "items" (list))))
+         (empty (make-json-object "isIncomplete" t "items" (json-empty-array))))
     (if (not text)
         empty
         (let ((prefix (symbol-at-position text line col)))
@@ -194,14 +225,15 @@
                 (let ((completions (symbol-completions prefix)))
                   (make-json-object
                    "isIncomplete" :false
-                   "items" (mapcar
-                            (lambda (c)
-                              (destructuring-bind (name kind pkg) c
-                                (make-json-object
-                                 "label" name
-                                 "kind" kind
-                                 "detail" (format nil "~(~a~)" pkg))))
-                            completions)))))))))
+                   "items" (json-array
+                            (mapcar
+                             (lambda (c)
+                               (destructuring-bind (name kind pkg) c
+                                 (make-json-object
+                                  "label" name
+                                  "kind" kind
+                                  "detail" (format nil "~(~a~)" pkg))))
+                             completions))))))))))
 
 ;;; --- Go to Definition ---
 
@@ -323,7 +355,7 @@
       (extract-document-symbols text))))
 
 (defun extract-document-symbols (text)
-  "Parse TEXT for top-level def* forms and return LSP DocumentSymbol list."
+  "Parse TEXT for top-level definition forms and return LSP DocumentSymbol list."
   (let ((symbols nil)
         (pos 0)
         (len (length text)))
@@ -345,54 +377,45 @@
                              symbols))
                      (setf pos match-end))
                    (return))))
-    (nreverse symbols)))
+    (json-array (nreverse symbols))))
 
 (defun find-next-definition (text start)
-  "Find the next (def...) form in TEXT starting at START.
-Returns (values match-start match-end name symbol-kind line) or NIL."
+  "Find the next recognized definition form in TEXT starting at START.
+Returns (values match-start match-end name symbol-kind line) or NIL.
+Only operators in *definition-operators* count: matching any \"def\"
+prefix would present calls like (default-foo bar) as symbols."
   (let ((len (length text)))
     (loop for i from start below len
-          do (when (and (char= (char text i) #\()
-                        (< (+ i 4) len)
-                        (string-equal "def" (subseq text (1+ i)
-                                                     (min (+ i 4) len))))
-               ;; Found a (def... - read the def-type and name
-               (let* ((space-pos (position-if
-                                  (lambda (c) (member c '(#\Space #\Tab #\Newline)))
-                                  text :start (1+ i)))
-                      (def-type (when space-pos
-                                  (string-downcase (subseq text (1+ i) space-pos))))
-                      (name-start (when space-pos
-                                    (position-if-not
-                                     (lambda (c) (member c '(#\Space #\Tab #\Newline)))
-                                     text :start space-pos)))
-                      (name-end (when name-start
-                                  (position-if
-                                   (lambda (c) (member c '(#\Space #\Tab #\Newline #\( #\))))
-                                   text :start name-start)))
-                      (name (when (and name-start name-end)
-                              (subseq text name-start name-end)))
-                      (line (count #\Newline text :end i)))
-                 (when (and def-type name (> (length name) 0))
-                   (let ((kind (def-type-to-symbol-kind def-type)))
-                     (return (values i (or name-end (1+ i)) name kind line)))))))))
+          do (when (char= (char text i) #\()
+               (let* ((op (operator-after-paren text i))
+                      (kind (and op (definition-operator-kind op))))
+                 (when kind
+                   (multiple-value-bind (name name-start name-end)
+                       (form-name-token text (+ i 1 (length op)))
+                     (declare (ignore name-start))
+                     (when (and name (> (length name) 0))
+                       (return (values i
+                                       (or name-end (1+ i))
+                                       name
+                                       (def-kind-to-symbol-kind kind)
+                                       (count #\Newline text :end i)))))))))))
 
-(defun def-type-to-symbol-kind (def-type)
-  "Map a Common Lisp def-type string to LSP SymbolKind."
-  (cond
-    ((string= def-type "defun") 12)           ; Function
-    ((string= def-type "defmacro") 12)        ; Function
-    ((string= def-type "defgeneric") 12)      ; Function
-    ((string= def-type "defmethod") 6)        ; Method
-    ((string= def-type "defvar") 13)          ; Variable
-    ((string= def-type "defparameter") 13)    ; Variable
-    ((string= def-type "defconstant") 14)     ; Constant
-    ((string= def-type "defclass") 5)         ; Class
-    ((string= def-type "defstruct") 23)       ; Struct
-    ((string= def-type "defpackage") 4)       ; Package
-    ((string= def-type "define-condition") 5) ; Class
-    ((string= def-type "deftype") 26)         ; TypeParameter
-    (t 12)))                                   ; Function (default)
+(defun def-kind-to-symbol-kind (kind)
+  "Map an index-entry definition kind to LSP SymbolKind."
+  (case kind
+    (:function    12) ; Function
+    (:macro       12) ; Function
+    (:generic     12) ; Function
+    (:method       6) ; Method
+    (:variable    13) ; Variable
+    (:parameter   13) ; Variable
+    (:constant    14) ; Constant
+    (:class        5) ; Class
+    (:struct      23) ; Struct
+    (:package      4) ; Package
+    (:condition    5) ; Class
+    (:type        26) ; TypeParameter
+    (t            12)))
 
 (defun find-form-end-line (text start)
   "Find the line number where the top-level form starting at START ends."
@@ -446,7 +469,7 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                        "kind" kind
                        "containerName" container-name
                        "location" loc))))
-                results)))))
+                (json-array results))))))
 
 ;;; --- Completion Resolve ---
 
@@ -487,7 +510,7 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                                   "end" (make-json-object "line" (car end-lc)
                                                           "character" (cdr end-lc)))
                          "kind" 1)))  ; 1 = Text
-                    occurrences)))))))
+                    (json-array occurrences))))))))
 
 ;;; --- Selection Range ---
 
@@ -498,7 +521,8 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
          (positions (json-get params "positions"))
          (text (document-text uri)))
     (when text
-      (mapcar (lambda (pos)
+      (json-array
+       (mapcar (lambda (pos)
                 (let* ((line (json-get pos "line"))
                        (col (json-get pos "character"))
                        (offset (line-col-to-offset text line col))
@@ -525,7 +549,7 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                        "range" (make-json-object
                                 "start" (make-json-object "line" line "character" col)
                                 "end" (make-json-object "line" line "character" col))))))
-              positions))))
+              positions)))))
 
 ;;; --- Folding Range ---
 
@@ -536,16 +560,17 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
          (text (document-text uri)))
     (when text
       (let ((forms (find-top-level-forms text)))
-        (remove nil
-                (mapcar (lambda (form)
-                          (destructuring-bind (start-off end-off start-line end-line) form
-                            (declare (ignore start-off end-off))
-                            (when (> end-line start-line)
-                              (make-json-object
-                               "startLine" start-line
-                               "endLine" end-line
-                               "kind" "region"))))
-                        forms))))))
+        (json-array
+         (remove nil
+                 (mapcar (lambda (form)
+                           (destructuring-bind (start-off end-off start-line end-line) form
+                             (declare (ignore start-off end-off))
+                             (when (> end-line start-line)
+                               (make-json-object
+                                "startLine" start-line
+                                "endLine" end-line
+                                "kind" "region"))))
+                         forms)))))))
 
 ;;; --- Formatting ---
 
@@ -597,7 +622,12 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
       (let ((old-name (symbol-at-position text line col)))
         (when old-name
           (lsp-log "Rename: ~a -> ~a" old-name new-name)
-          (let ((occurrences (find-all-symbol-occurrences text old-name)))
+          ;; Only rename code occurrences: edits inside comments or strings
+          ;; would corrupt documentation and literals
+          (let ((occurrences (remove-if
+                              (lambda (occ)
+                                (position-in-comment-or-string-p text (car occ)))
+                              (find-all-symbol-occurrences text old-name))))
             (when occurrences
               (make-json-object
                "changes" (list
@@ -617,6 +647,36 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                                         occurrences)))))))))))
 
 ;;; --- Code Actions ---
+
+(defun defpackage-export-edit (text sym-name)
+  "Build an edit adding SYM-NAME to the first (defpackage ...) form's :export
+list in TEXT, creating the clause when it is missing.
+Returns (values start-offset end-offset insert-text) or NIL."
+  (dolist (form (find-top-level-forms text))
+    (let ((start (first form))
+          (end (second form)))
+      (when (string-equal "defpackage" (or (operator-after-paren text start) ""))
+        (let* ((form-text (subseq text start end))
+               (export-pos (search ":export" form-text :test #'char-equal)))
+          (if export-pos
+              ;; Insert into the existing export clause, right after the
+              ;; :export keyword and any following whitespace (the clause's
+              ;; opening paren precedes the keyword, so no paren search here)
+              (let ((len (length form-text))
+                    (i (+ export-pos (length ":export"))))
+                (loop while (and (< i len)
+                                 (member (char form-text i)
+                                         '(#\Space #\Tab #\Newline #\Return)))
+                      do (incf i))
+                (let ((insert-offset (+ start i)))
+                  (return-from defpackage-export-edit
+                    (values insert-offset insert-offset
+                            (format nil "#:~a " (string-downcase sym-name))))))
+              ;; No :export clause: add one just before the form's closing paren
+              (let ((insert-offset (+ start (length form-text) -1)))
+                (return-from defpackage-export-edit
+                  (values insert-offset insert-offset
+                          (format nil "~%  (:export #:~a)" (string-downcase sym-name)))))))))))
 
 (defun handle-code-action (params)
   "Handle textDocument/codeAction - suggest code fixes and refactorings."
@@ -652,12 +712,27 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                                                                         "end" (make-json-object "line" el "character" ec))
                                                                "newText" (format nil "~a:~a" pkg-name sym-name))))))))))
                         actions))))))
-        ;; Action: Export symbol (if in a defun/defvar etc)
-        (when sym-name
-          (push (make-json-object
-                 "title" (format nil "Export symbol: ~a" sym-name)
-                 "kind" "refactor")
-                actions))
+        ;; Action: Export symbol - add it to the defpackage :export list
+        (when (and sym-name (not (find #\: sym-name)))
+          (multiple-value-bind (start-offset end-offset new-text)
+              (defpackage-export-edit text sym-name)
+            (when start-offset
+              (let ((start-lc (offset-to-line-col text start-offset))
+                    (end-lc (offset-to-line-col text end-offset)))
+                (push (make-json-object
+                       "title" (format nil "Export symbol: ~a" sym-name)
+                       "kind" "refactor"
+                       "edit" (make-json-object
+                               "changes" (list
+                                          (cons uri
+                                                (list (make-json-object
+                                                       "range" (make-json-object
+                                                                "start" (make-json-object "line" (car start-lc)
+                                                                                          "character" (cdr start-lc))
+                                                                "end" (make-json-object "line" (car end-lc)
+                                                                                        "character" (cdr end-lc)))
+                                                       "newText" new-text))))))
+                      actions)))))
         ;; Action: Insert defpackage template
         (when (and (zerop line) (zerop col)
                    (not (search "(defpackage" text :test #'char-equal))
@@ -674,7 +749,7 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
                                                           "end" (make-json-object "line" 0 "character" 0))
                                                  "newText" (format nil "(defpackage :my-package~%  (:use :cl)~%  (:export))~%~%(in-package :my-package)~%~%")))))))
                 actions))))
-    (nreverse actions)))
+    (json-array (nreverse actions))))
 
 ;;; --- Semantic Tokens ---
 
@@ -690,7 +765,7 @@ Returns (values match-start match-end name symbol-kind line) or NIL."
     (when text
       (let ((tokens (collect-semantic-tokens text)))
         (make-json-object
-         "data" (or tokens :empty-array))))))
+         "data" (json-array tokens))))))
 
 (defun collect-semantic-tokens (text)
   "Collect semantic tokens from TEXT.
@@ -846,12 +921,7 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
                                         (symbol-char-p (char text fn-end)))
                              do (incf fn-end))
                        (let* ((fn-name (subseq text fn-start fn-end))
-                              (arglist (handler-case
-                                           (multiple-value-bind (sym)
-                                               (find-symbol-in-packages fn-name)
-                                             (when (and sym (fboundp sym))
-                                               (sb-introspect:function-lambda-list sym)))
-                                         (error () nil))))
+                              (arglist (get-function-arglist fn-name)))
                          (when arglist
                            ;; Show parameter names for positional args
                            (let ((arg-index 0)
@@ -905,7 +975,7 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
                                                   do (incf pos)))
                                         (incf arg-index))))))))
                    (incf i)))
-        (nreverse hints)))))
+        (json-array (nreverse hints))))))
 
 ;;; --- Call Hierarchy ---
 
@@ -957,7 +1027,7 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
                      "fromRanges" (list (make-json-object
                                          "start" (make-json-object "line" line "character" col)
                                          "end" (make-json-object "line" line "character" col))))))
-                callers)))))
+                (json-array callers))))))
 
 (defun handle-call-hierarchy-outgoing (params)
   "Handle callHierarchy/outgoingCalls."
@@ -982,7 +1052,7 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
                      "fromRanges" (list (make-json-object
                                          "start" (make-json-object "line" line "character" col)
                                          "end" (make-json-object "line" line "character" col))))))
-                callees)))))
+                 (json-array callees))))))
 
 ;;; --- Code Lens ---
 
@@ -1010,7 +1080,7 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
                                             "0 references"))
                               "command" ""))
                   lenses)))
-        (nreverse lenses)))))
+        (json-array (nreverse lenses))))))
 
 ;;; --- Linked Editing Range ---
 
@@ -1063,12 +1133,17 @@ deltaLine, deltaStartChar, length, tokenType, tokenModifiers."
 (defun handle-did-save (params)
   (let* ((td (json-get params "textDocument"))
          (uri (json-get td "uri"))
-         (path (uri-to-path uri)))
+         (path (uri-to-path uri))
+         (save-text (json-get td "text")))
+    ;; When the client sends text on save (we advertise includeText), trust it
+    ;; as the authoritative buffer content
+    (when save-text
+      (document-change uri save-text))
     ;; Re-index from disk on save for accurate positions
     (when (probe-file path)
       (index-file path))
-    ;; Full diagnostic pass on save
-    (run-diagnostics uri)))
+    ;; Full diagnostic pass on save (debounced/serialized like edits)
+    (schedule-diagnostics uri)))
 
 (defun handle-did-close (params)
   (let* ((td (json-get params "textDocument"))
