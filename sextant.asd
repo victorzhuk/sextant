@@ -1,5 +1,5 @@
 (defsystem "sextant"
-  :version "0.2.0"
+  :version "0.3.0"
   :author "Glenn Thompson"
   :license "MIT"
   :description "A Common Lisp Language Server Protocol (LSP) implementation"
